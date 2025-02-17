@@ -21,7 +21,7 @@ if (!extension_loaded('imagick')) {
 }
 
 // Check minimum PHP version
-if (version_compare(PHP_VERSION, '7.2.0', '<')) {
+if (version_compare(PHP_VERSION, '8.2.0', '<')) {
     add_action('admin_notices', function() {
         echo '<div class="error"><p>Zelf WebP requires PHP 7.2.0 or higher.</p></div>';
     });
@@ -83,6 +83,33 @@ function optimize_and_convert_to_webp($metadata, $attachment_id) {
         // Optimize and convert original to WebP
         $optimizerChain->optimize($file_path);
         $im = new Imagick($file_path);
+        
+        // Get original dimensions
+        $current_width = $im->getImageWidth();
+        $current_height = $im->getImageHeight();
+        
+        // Check if image exceeds maximum dimensions
+        $max_width = 1920;
+        $max_height = 1080;
+        
+        if ($current_width > $max_width || $current_height > $max_height) {
+            $ratio = $current_width / $current_height;
+            
+            if ($current_width / $max_width > $current_height / $max_height) {
+                $new_width = $max_width;
+                $new_height = round($max_width / $ratio);
+            } else {
+                $new_height = $max_height;
+                $new_width = round($max_height * $ratio);
+            }
+            
+            $im->resizeImage($new_width, $new_height, Imagick::FILTER_LANCZOS, 1);
+            
+            // Update metadata with new dimensions
+            $metadata['width'] = $new_width;
+            $metadata['height'] = $new_height;
+        }
+
         $im->setImageFormat('webp');
         
         // Replace original file with WebP version
