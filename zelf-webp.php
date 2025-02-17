@@ -96,46 +96,58 @@ function optimize_and_convert_to_webp($metadata, $attachment_id) {
             $ratio = $current_width / $current_height;
             
             if ($current_width / $max_width > $current_height / $max_height) {
-                $new_width = $max_width;
-                $new_height = round($max_width / $ratio);
+                $new_width = (int)$max_width;
+                $new_height = (int)round($max_width / $ratio);
             } else {
-                $new_height = $max_height;
-                $new_width = round($max_height * $ratio);
+                $new_height = (int)$max_height;
+                $new_width = (int)round($max_height * $ratio);
             }
             
-            $im->resizeImage($new_width, $new_height, Imagick::FILTER_LANCZOS, 1);
+            $im->resizeImage((int)$new_width, (int)$new_height, Imagick::FILTER_LANCZOS, 1);
             
             // Update metadata with new dimensions
-            $metadata['width'] = $new_width;
-            $metadata['height'] = $new_height;
+            $metadata['width'] = (int)$new_width;
+            $metadata['height'] = (int)$new_height;
         }
 
+        // Create WebP version
         $im->setImageFormat('webp');
-        
-        // Replace original file with WebP version
         $webp_path = $file_info['dirname'] . '/' . $file_info['filename'] . '.webp';
-        
-        // Verify write permissions
-        if (!is_writable($file_info['dirname'])) {
-            throw new Exception('Directory is not writable');
-        }
-
         $im->writeImage($webp_path);
+        
+        // Clear Imagick resources
         $im->clear();
         $im->destroy();
+        unset($im);
         
-        // Verify the WebP file was created successfully
-        if (!file_exists($webp_path) || !is_readable($webp_path)) {
-            throw new Exception('Failed to create WebP file');
-        }
+        // Force garbage collection
+        gc_collect_cycles();
         
-        // Delete original file and update attachment path
-        if (file_exists($file_path)) {
-            unlink($file_path);
-        }
+        // Update WordPress to use the WebP file BEFORE deleting the original
         update_attached_file($attachment_id, $webp_path);
+        wp_update_attachment_metadata($attachment_id, $metadata);
         
-        // Update main file metadata with correct file size
+        // Now try to delete the original
+        clearstatcache(true, $file_path);
+        error_log('Zelf WebP: File path before deletion: ' . $file_path);
+        error_log('Zelf WebP: File exists before deletion: ' . (file_exists($file_path) ? 'yes' : 'no'));
+        
+        if (file_exists($file_path)) {
+            @chmod($file_path, 0777);
+            if (@unlink($file_path)) {
+                error_log('Zelf WebP: Successfully deleted original file');
+            } else {
+                error_log('Zelf WebP: Failed to delete file - Error: ' . error_get_last()['message']);
+            }
+        }
+        
+        // Double check if file was recreated
+        clearstatcache(true, $file_path);
+        if (file_exists($file_path)) {
+            error_log('Zelf WebP: File still exists after deletion attempt');
+        }
+        
+        // Update metadata
         $metadata['file'] = str_replace($upload_dir['basedir'] . '/', '', $webp_path);
         $metadata['mime-type'] = 'image/webp';
         $metadata['filesize'] = filesize($webp_path);
@@ -173,12 +185,12 @@ function optimize_and_convert_to_webp($metadata, $attachment_id) {
                     $ratio_orig = $current_width / $current_height;
                     
                     if ($target_width / $target_height > $ratio_orig) {
-                        $target_width = $target_height * $ratio_orig;
+                        $target_width = (int)round($target_height * $ratio_orig);
                     } else {
-                        $target_height = $target_width / $ratio_orig;
+                        $target_height = (int)round($target_width / $ratio_orig);
                     }
                     
-                    $im->resizeImage($target_width, $target_height, Imagick::FILTER_LANCZOS, 1);
+                    $im->resizeImage((int)$target_width, (int)$target_height, Imagick::FILTER_LANCZOS, 1);
                 }
                 
                 // Save as WebP
@@ -196,8 +208,8 @@ function optimize_and_convert_to_webp($metadata, $attachment_id) {
                 $metadata['sizes'][$size]['file'] = $size_file_info['filename'] . '.webp';
                 $metadata['sizes'][$size]['mime-type'] = 'image/webp';
                 $metadata['sizes'][$size]['filesize'] = filesize($size_webp_path);
-                $metadata['sizes'][$size]['width'] = round($target_width);
-                $metadata['sizes'][$size]['height'] = round($target_height);
+                $metadata['sizes'][$size]['width'] = (int)$target_width;
+                $metadata['sizes'][$size]['height'] = (int)$target_height;
             }
         }
     } catch (Exception $e) {
