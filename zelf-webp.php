@@ -12,6 +12,14 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+// Add this near the top of your file with other checks
+if (!class_exists('Imagick') || !method_exists('Imagick', 'identifyImage')) {
+    add_action('admin_notices', function() {
+        echo '<div class="error"><p>Smart cropping requires Imagick with face detection support.</p></div>';
+    });
+    // Don't return here, let the plugin work without smart cropping
+}
+
 // Verify Imagick is available
 if (!extension_loaded('imagick')) {
     add_action('admin_notices', function() {
@@ -34,55 +42,104 @@ require_once __DIR__ . '/vendor/autoload.php';
 // Use necessary classes
 use Spatie\ImageOptimizer\OptimizerChainFactory;
 
-// Remove the complete blocking of image editors
-// add_filter('wp_image_editors', function($editors) {
-//     return array();
-// });
+// Add these filters at the top of the file, after the initial plugin header and checks
+// Prevent WordPress from generating regular image sizes
+add_filter('intermediate_image_sizes', '__return_empty_array');
+add_filter('intermediate_image_sizes_advanced', '__return_empty_array');
 
-// Instead, let's hook into the intermediate image sizes generation
-add_filter('intermediate_image_sizes_advanced', function($sizes) {
-    return $sizes; // Allow WordPress to calculate the sizes
-});
-
-function optimize_and_convert_to_webp($metadata, $attachment_id) {
-    // Verify user capabilities
-    if (!current_user_can('upload_files')) {
-        return $metadata;
-    }
-
-    // Validate input parameters
-    if (!is_array($metadata) || !is_numeric($attachment_id)) {
-        return $metadata;
-    }
-
-    $upload_dir = wp_upload_dir();
+function smart_crop_image($im, $target_width, $target_height) {
+    // Get original dimensions
+    $orig_width = $im->getImageWidth();
+    $orig_height = $im->getImageHeight();
     
-    // Validate upload directory
-    if (isset($upload_dir['error']) && $upload_dir['error'] !== false) {
-        return $metadata;
-    }
-
-    $file_path = get_attached_file($attachment_id);
-    
-    // Check if file exists and is readable
-    if (!$file_path || !is_readable($file_path)) {
-        return $metadata;
-    }
-
-    $file_info = pathinfo($file_path);
-
-    // Validate file extension
-    if (!isset($file_info['extension']) || !in_array(strtolower($file_info['extension']), ['jpeg', 'jpg', 'png'], true)) {
-        return $metadata;
+    // If image is already smaller than target, don't crop
+    if ($orig_width <= $target_width && $orig_height <= $target_height) {
+        return;
     }
 
     try {
-        // Instantiate the optimizer
-        $optimizerChain = OptimizerChainFactory::create();
+        // Try to detect faces
+        $faces = $im->identifyImage()['facedetect:haarcascade_frontalface_alt'];
+        
+        if (!empty($faces)) {
+            // Get the center point of all faces
+            $face_x = 0;
+            $face_y = 0;
+            $num_faces = count($faces);
+            
+            foreach ($faces as $face) {
+                $face_x += $face['x'] + ($face['width'] / 2);
+                $face_y += $face['y'] + ($face['height'] / 2);
+            }
+            
+            $center_x = $face_x / $num_faces;
+            $center_y = $face_y / $num_faces;
+            
+            // Calculate crop coordinates
+            $scale = max($target_width / $orig_width, $target_height / $orig_height);
+            $crop_width = $target_width / $scale;
+            $crop_height = $target_height / $scale;
+            
+            $x = max(0, min($center_x - ($crop_width / 2), $orig_width - $crop_width));
+            $y = max(0, min($center_y - ($crop_height / 2), $orig_height - $crop_height));
+            
+            // Crop around faces
+            $im->cropImage((int)$crop_width, (int)$crop_height, (int)$x, (int)$y);
+            $im->resizeImage($target_width, $target_height, Imagick::FILTER_LANCZOS, 1);
+            return;
+        }
+    } catch (Exception $e) {
+        // If face detection fails, fall back to center crop
+        error_log('Face detection failed: ' . $e->getMessage());
+    }
+    
+    // Default to center crop if no faces detected or if face detection fails
+    $im->cropThumbnailImage($target_width, $target_height);
+}
 
-        // Optimize and convert original to WebP
-        $optimizerChain->optimize($file_path);
+function optimize_and_convert_to_webp($metadata, $attachment_id) {
+    // Increase memory limit temporarily
+    $current_memory_limit = ini_get('memory_limit');
+    ini_set('memory_limit', '256M');
+    
+    try {
+        // Verify user capabilities
+        if (!current_user_can('upload_files')) {
+            return $metadata;
+        }
+
+        // Validate input parameters
+        if (!is_array($metadata) || !is_numeric($attachment_id)) {
+            return $metadata;
+        }
+
+        $upload_dir = wp_upload_dir();
+        
+        // Validate upload directory
+        if (isset($upload_dir['error']) && $upload_dir['error'] !== false) {
+            return $metadata;
+        }
+
+        $file_path = get_attached_file($attachment_id);
+        
+        // Check if file exists and is readable
+        if (!$file_path || !is_readable($file_path)) {
+            return $metadata;
+        }
+
+        $file_info = pathinfo($file_path);
+
+        // Validate file extension
+        if (!isset($file_info['extension']) || !in_array(strtolower($file_info['extension']), ['jpeg', 'jpg', 'png'], true)) {
+            return $metadata;
+        }
+
+        // Process original image
         $im = new Imagick($file_path);
+        $im->setOption('webp:method', '4');
+        $im->setOption('webp:lossless', 'false');
+        $im->setOption('webp:low-memory', 'true');
+        $im->setImageCompressionQuality(85);
         
         // Get original dimensions
         $current_width = $im->getImageWidth();
@@ -108,136 +165,107 @@ function optimize_and_convert_to_webp($metadata, $attachment_id) {
             // Update metadata with new dimensions
             $metadata['width'] = (int)$new_width;
             $metadata['height'] = (int)$new_height;
+            
+            // Update current dimensions
+            $current_width = $new_width;
+            $current_height = $new_height;
         }
 
-        // Create WebP version
+        // Create original WebP version
         $im->setImageFormat('webp');
         $webp_path = $file_info['dirname'] . '/' . $file_info['filename'] . '.webp';
         $im->writeImage($webp_path);
         
-        // Clear Imagick resources
+        // Clear original resources
         $im->clear();
         $im->destroy();
-        unset($im);
+
+        // Initialize sizes array if not exists
+        if (!isset($metadata['sizes'])) {
+            $metadata['sizes'] = array();
+        }
+
+        // Define the sizes we want to process
+        $sizes_to_process = array(
+            'thumbnail' => array(
+                'width' => get_option('thumbnail_size_w'),
+                'height' => get_option('thumbnail_size_h', 0),
+                'crop' => false
+            ),
+            'medium' => array(
+                'width' => get_option('medium_size_w'),
+                'height' => get_option('medium_size_h'),
+                'crop' => false
+            ),
+            'large' => array(
+                'width' => get_option('large_size_w'),
+                'height' => get_option('large_size_h'),
+                'crop' => false
+            )
+        );
         
-        // Force garbage collection
-        gc_collect_cycles();
-        
-        // Update WordPress to use the WebP file BEFORE deleting the original
-        update_attached_file($attachment_id, $webp_path);
-        wp_update_attachment_metadata($attachment_id, $metadata);
-        
-        // Now try to delete the original
-        clearstatcache(true, $file_path);
-        error_log('Zelf WebP: File path before deletion: ' . $file_path);
-        error_log('Zelf WebP: File exists before deletion: ' . (file_exists($file_path) ? 'yes' : 'no'));
-        
-        if (file_exists($file_path)) {
-            @chmod($file_path, 0777);
-            if (@unlink($file_path)) {
-                error_log('Zelf WebP: Successfully deleted original file');
+        // Process each size from the WebP original
+        foreach ($sizes_to_process as $size => $dimensions) {
+            // Create new Imagick instance from the WebP file
+            $size_im = new Imagick($webp_path);
+            
+            $width = (int)$dimensions['width'];
+            $height = (int)$dimensions['height'];
+            
+            // Calculate new dimensions, respecting when height is 0
+            if ($height === 0) {
+                $ratio = $current_height / $current_width;
+                $final_width = $width;
+                $final_height = (int)round($width * $ratio);
             } else {
-                error_log('Zelf WebP: Failed to delete file - Error: ' . error_get_last()['message']);
+                $ratio = $current_width / $current_height;
+                if ($width / $height > $ratio) {
+                    $final_width = (int)round($height * $ratio);
+                    $final_height = $height;
+                } else {
+                    $final_width = $width;
+                    $final_height = (int)round($width / $ratio);
+                }
             }
+            
+            // Resize the image
+            $size_im->resizeImage($final_width, $final_height, Imagick::FILTER_LANCZOS, 1);
+
+            // Generate size-specific filename
+            $size_filename = $file_info['filename'] . '-' . $final_width . 'x' . $final_height . '.webp';
+            $size_path = $file_info['dirname'] . '/' . $size_filename;
+            
+            // Save the sized WebP version
+            $size_im->writeImage($size_path);
+
+            // Add size to metadata
+            $metadata['sizes'][$size] = array(
+                'file' => basename($size_filename),
+                'width' => $final_width,
+                'height' => $final_height,
+                'mime-type' => 'image/webp',
+                'filesize' => filesize($size_path)
+            );
+
+            // Clear resources
+            $size_im->clear();
+            $size_im->destroy();
         }
-        
-        // Double check if file was recreated
-        clearstatcache(true, $file_path);
-        if (file_exists($file_path)) {
-            error_log('Zelf WebP: File still exists after deletion attempt');
-        }
-        
-        // Update metadata
+
+        // Update original metadata
         $metadata['file'] = str_replace($upload_dir['basedir'] . '/', '', $webp_path);
         $metadata['mime-type'] = 'image/webp';
         $metadata['filesize'] = filesize($webp_path);
-
-        // Process all image sizes
-        if (isset($metadata['sizes']) && is_array($metadata['sizes'])) {
-            foreach ($metadata['sizes'] as $size => $size_info) {
-                // Validate size info
-                if (!isset($size_info['file']) || !isset($size_info['width']) || !isset($size_info['height'])) {
-                    continue;
-                }
-
-                // Get paths
-                $size_file_path = $upload_dir['path'] . '/' . $size_info['file'];
-                $size_file_info = pathinfo($size_info['file']);
-                
-                // Convert directly to WebP
-                $im = new Imagick($webp_path);
-                
-                // Get the current dimensions
-                $current_width = $im->getImageWidth();
-                $current_height = $im->getImageHeight();
-                
-                // Get target dimensions
-                $target_width = $size_info['width'];
-                $target_height = $size_info['height'];
-                
-                // Check if this size should be cropped
-                $size_data = get_image_size_data($size);
-                $crop = !empty($size_data['crop']);
-                
-                if ($crop) {
-                    $im->cropThumbnailImage($target_width, $target_height);
-                } else {
-                    $ratio_orig = $current_width / $current_height;
-                    
-                    if ($target_width / $target_height > $ratio_orig) {
-                        $target_width = (int)round($target_height * $ratio_orig);
-                    } else {
-                        $target_height = (int)round($target_width / $ratio_orig);
-                    }
-                    
-                    $im->resizeImage((int)$target_width, (int)$target_height, Imagick::FILTER_LANCZOS, 1);
-                }
-                
-                // Save as WebP
-                $size_webp_path = $upload_dir['path'] . '/' . $size_file_info['filename'] . '.webp';
-                $im->writeImage($size_webp_path);
-                $im->clear();
-                $im->destroy();
-                
-                // Delete the original sized file
-                if (file_exists($size_file_path)) {
-                    unlink($size_file_path);
-                }
-                
-                // Update metadata to use webp for this size
-                $metadata['sizes'][$size]['file'] = $size_file_info['filename'] . '.webp';
-                $metadata['sizes'][$size]['mime-type'] = 'image/webp';
-                $metadata['sizes'][$size]['filesize'] = filesize($size_webp_path);
-                $metadata['sizes'][$size]['width'] = (int)$target_width;
-                $metadata['sizes'][$size]['height'] = (int)$target_height;
-            }
-        }
+        
     } catch (Exception $e) {
-        // Log error and return original metadata
         error_log('Zelf WebP Error: ' . $e->getMessage());
         return $metadata;
+    } finally {
+        // Restore original memory limit
+        ini_set('memory_limit', $current_memory_limit);
     }
 
     return $metadata;
-}
-
-function get_image_size_data($size) {
-    // Sanitize size name
-    $size = sanitize_key($size);
-    
-    global $_wp_additional_image_sizes;
-    
-    if (in_array($size, array('thumbnail', 'medium', 'medium_large', 'large'), true)) {
-        return array(
-            'width' => absint(get_option($size . '_size_w')),
-            'height' => absint(get_option($size . '_size_h')),
-            'crop' => get_option($size . '_crop')
-        );
-    } elseif (isset($_wp_additional_image_sizes[$size])) {
-        return $_wp_additional_image_sizes[$size];
-    }
-    
-    return array('crop' => false);
 }
 
 add_filter('wp_generate_attachment_metadata', 'optimize_and_convert_to_webp', 10, 2);
